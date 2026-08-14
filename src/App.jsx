@@ -2,10 +2,11 @@ import { useState, useEffect, useRef } from "react";
 import {
   Wheat, Package, Layers, ShoppingBag, ClipboardList, ChefHat, Croissant,
   Percent, Info, ArrowRight, Plus, Trash2, Check, Loader2, AlertTriangle, Calculator, Users,
-  Save, History, Download, Upload, RotateCcw, Lock,
+  Save, History, Download, Upload, RotateCcw, Lock, FileSpreadsheet, Table2,
 } from "lucide-react";
 
 import { loadData, saveData, subscribe, isShared, saveSnapshot, listSnapshots, getSnapshot, downloadBackup, readBackupFile } from "./store.js";
+import { buildSheets, downloadSheet, downloadAllSheets } from "./exportCsv.js";
 
 /* ---------- helpers ---------- */
 const yen = (n) => "¥" + Math.round(n || 0).toLocaleString("ja-JP");
@@ -259,6 +260,7 @@ export default function BakeryCostApp() {
     }
   };
 
+
   useEffect(() => { if (tab === "backup" && status === "ready") refreshHistory(); }, [tab, status]);
 
   /* ---- lookups ---- */
@@ -315,6 +317,17 @@ export default function BakeryCostApp() {
     const rate = p.price > 0 ? total / p.price : Infinity;
     const simRate = p.simPrice > 0 ? total / p.simPrice : Infinity;
     return { breadPart, pkgPart, total, suggested, rate, simRate };
+  };
+
+  /* ---- CSV書き出し ---- */
+  const exportSheets = () => buildSheets(currentPayload(), {
+    doughWeight, doughCost, doughCostPerG, fillingCalc, fillingPerG, breadCalc, productCalc,
+  });
+  const doExportAll = async () => {
+    setBusy("書き出し中…");
+    await downloadAllSheets(exportSheets());
+    setBusy("");
+    setNotice("6つのCSVを書き出しました。Googleドライブにドラッグ&ドロップして開けます");
   };
 
   /* ---- shipment aggregation（製品→パン→生地/自家製→原材料） ---- */
@@ -442,6 +455,7 @@ export default function BakeryCostApp() {
     { id: "breads", label: "パン", icon: Croissant },
     { id: "products", label: "製品", icon: ShoppingBag },
     { id: "shipment", label: "出荷・所要量", icon: ClipboardList },
+    { id: "export", label: "書き出し", icon: FileSpreadsheet },
     { id: "backup", label: "バックアップ", icon: History },
   ];
 
@@ -907,6 +921,64 @@ export default function BakeryCostApp() {
                 <p className="flex items-center gap-1.5 text-xs text-stone-400"><ArrowRight size={14} /> 製品 → パン → 生地・自家製 → 原材料、と一本でつながっています。</p>
               </>
             )}
+          </>
+        )}
+
+        {/* ===== 書き出し（スプレッドシート） ===== */}
+        {tab === "export" && (
+          <>
+            <div className="flex items-start gap-2 rounded-xl bg-amber-50 px-4 py-3 text-sm text-amber-900">
+              <Info size={16} className="mt-0.5 shrink-0" />
+              <p>登録データをCSVで書き出します。<b>Googleスプレッドシートにドラッグ&ドロップするだけ</b>で開けます（日本語が文字化けしない形式で出力）。</p>
+            </div>
+
+            {notice && (
+              <div className="flex items-center justify-between rounded-xl bg-stone-800 px-4 py-2.5 text-sm text-white">
+                <span>{notice}</span>
+                <button onClick={() => setNotice("")} className="text-stone-400 hover:text-white">×</button>
+              </div>
+            )}
+
+            <button onClick={doExportAll} disabled={!!busy}
+              className="flex w-full items-center justify-center gap-2 rounded-xl bg-amber-500 px-4 py-3.5 text-sm font-semibold text-white hover:bg-amber-600 disabled:opacity-50">
+              <Download size={18} /> 全データを書き出す（6ファイル）
+            </button>
+            {busy && <p className="flex items-center gap-2 text-sm text-stone-500"><Loader2 size={14} className="animate-spin" />{busy}</p>}
+
+            <Card className="overflow-hidden">
+              <div className="border-b border-stone-100 bg-stone-50 px-4 py-3 font-semibold">
+                <span className="flex items-center gap-2"><Table2 size={16} className="text-amber-500" /> 個別に書き出す</span>
+              </div>
+              <ul className="divide-y divide-stone-100">
+                {exportSheets().map((sh) => (
+                  <li key={sh.name} className="flex items-center justify-between gap-3 px-4 py-3">
+                    <div className="min-w-0">
+                      <div className="font-medium">{sh.name}</div>
+                      <div className="truncate text-xs text-stone-400">{sh.csv.split("\r\n").length - 1} 行</div>
+                    </div>
+                    <button onClick={() => downloadSheet(sh)}
+                      className="flex shrink-0 items-center gap-1.5 rounded-lg border border-stone-300 px-3 py-1.5 text-sm font-medium text-stone-700 hover:border-amber-400 hover:text-amber-700">
+                      <Download size={14} /> CSV
+                    </button>
+                  </li>
+                ))}
+              </ul>
+            </Card>
+
+            <Card className="overflow-hidden">
+              <div className="border-b border-stone-100 bg-stone-50 px-4 py-3 font-semibold">
+                <span className="flex items-center gap-2"><FileSpreadsheet size={16} className="text-amber-500" /> Googleスプレッドシートで開く方法</span>
+              </div>
+              <ol className="space-y-2 px-5 py-4 text-sm text-stone-600">
+                <li>1. 上のボタンでCSVファイルを書き出す</li>
+                <li>2. Googleドライブを開く（drive.google.com）</li>
+                <li>3. 書き出したファイルを画面にドラッグ&ドロップ</li>
+                <li>4. アップロードされたファイルを右クリック →「アプリで開く」→「Googleスプレッドシート」</li>
+              </ol>
+              <div className="border-t border-stone-100 px-4 py-2.5 text-xs text-stone-400">
+                書き出したデータを編集しても、アプリ側には反映されません（記録・共有・印刷用です）。
+              </div>
+            </Card>
           </>
         )}
 

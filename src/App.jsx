@@ -2,9 +2,10 @@ import { useState, useEffect, useRef } from "react";
 import {
   Wheat, Package, Layers, ShoppingBag, ClipboardList, ChefHat, Croissant,
   Percent, Info, ArrowRight, Plus, Trash2, Check, Loader2, AlertTriangle, Calculator, Users,
+  Save, History, Download, Upload, RotateCcw, Lock,
 } from "lucide-react";
 
-import { loadData, saveData, subscribe, isShared } from "./store.js";
+import { loadData, saveData, subscribe, isShared, saveSnapshot, listSnapshots, getSnapshot, downloadBackup, readBackupFile } from "./store.js";
 
 /* ---------- helpers ---------- */
 const yen = (n) => "¥" + Math.round(n || 0).toLocaleString("ja-JP");
@@ -13,6 +14,9 @@ const pct = (n) => (isFinite(n) ? (n * 100).toFixed(1) : "—") + "%";
 const kg = (g) => (g / 1000).toFixed(2);
 const round10 = (n) => Math.round(n / 10) * 10;
 const uid = (p) => p + "_" + Math.random().toString(36).slice(2, 8);
+
+/* リセット時に入力を求める確認ワード（変更可） */
+const RESET_PASSWORD = "リセット";
 
 const hasStore = true;
 
@@ -146,8 +150,14 @@ export default function BakeryCostApp() {
   const [shipment, setShipment] = useState({});
   const [targetRate, setTargetRate] = useState(0.25);
 
+  const [history, setHistory] = useState([]);
+  const [busy, setBusy] = useState("");
+  const [notice, setNotice] = useState("");
+
   const isPostLoad = useRef(true);
   const saveTimer = useRef(null);
+  const lastAutoSnap = useRef(0);
+  const fileRef = useRef(null);
 
   useEffect(() => {
     let unsub = () => {};
@@ -184,11 +194,72 @@ export default function BakeryCostApp() {
     setSaveState("saving");
     clearTimeout(saveTimer.current);
     saveTimer.current = setTimeout(async () => {
-      const ok = await saveData({ materials, packaging, doughs, fillings, breads, products, shipment, targetRate });
+      const payload = { materials, packaging, doughs, fillings, breads, products, shipment, targetRate };
+      const ok = await saveData(payload);
       saveTimer.current = null;
       setSaveState(ok ? "saved" : "idle");
+      // 自動バックアップ：最後の履歴から10分以上あいていれば1件残す
+      if (ok && Date.now() - lastAutoSnap.current > 10 * 60 * 1000) {
+        lastAutoSnap.current = Date.now();
+        saveSnapshot(payload, "自動").then(() => { if (tab === "backup") refreshHistory(); });
+      }
     }, 700);
   }, [materials, packaging, doughs, fillings, breads, products, shipment, targetRate, status]);
+
+  /* ---- バックアップ ---- */
+  const currentPayload = () => ({ materials, packaging, doughs, fillings, breads, products, shipment, targetRate });
+  const applyPayload = (d) => {
+    isPostLoad.current = true;
+    setMaterials(d.materials || []); setPackaging(d.packaging || []);
+    setDoughs(d.doughs || []); setFillings(d.fillings || []);
+    setBreads(d.breads || []); setProducts(d.products || []);
+    setShipment(d.shipment || {}); setTargetRate(typeof d.targetRate === "number" ? d.targetRate : 0.25);
+  };
+  const refreshHistory = async () => { setHistory(await listSnapshots()); };
+  const doManualBackup = async () => {
+    const label = window.prompt("バックアップに名前をつけてください（例：値上げ前）", "手動バックアップ");
+    if (label === null) return;
+    setBusy("保存中…");
+    await saveSnapshot(currentPayload(), label || "手動バックアップ");
+    await refreshHistory();
+    setBusy("");
+    setNotice("バックアップを保存しました");
+  };
+  const doRestore = async (snap) => {
+    if (!window.confirm(`「${snap.label}」（${new Date(snap.created_at).toLocaleString("ja-JP")}）の状態に戻します。\n現在の内容は自動でバックアップされます。よろしいですか？`)) return;
+    setBusy("復元中…");
+    await saveSnapshot(currentPayload(), "復元前の自動保存");
+    const payload = await getSnapshot(snap.id);
+    if (payload) {
+      applyPayload(payload);
+      await saveData(payload);
+      setNotice("復元しました");
+    } else {
+      setNotice("復元に失敗しました");
+    }
+    await refreshHistory();
+    setBusy("");
+  };
+  const doImportFile = async (e) => {
+    const file = e.target.files?.[0]; e.target.value = "";
+    if (!file) return;
+    try {
+      const data = await readBackupFile(file);
+      if (!window.confirm("このファイルの内容で上書きします。現在の内容は自動でバックアップされます。よろしいですか？")) return;
+      setBusy("読み込み中…");
+      await saveSnapshot(currentPayload(), "読み込み前の自動保存");
+      applyPayload(data);
+      await saveData(data);
+      await refreshHistory();
+      setBusy("");
+      setNotice("バックアップファイルを読み込みました");
+    } catch (err) {
+      setBusy("");
+      setNotice("読み込めませんでした：" + err.message);
+    }
+  };
+
+  useEffect(() => { if (tab === "backup" && status === "ready") refreshHistory(); }, [tab, status]);
 
   /* ---- lookups ---- */
   const matById = (id) => materials.find((m) => m.id === id);
@@ -335,10 +406,18 @@ export default function BakeryCostApp() {
   const setQty = (pId, v) => setShipment((s) => ({ ...s, [pId]: v }));
 
   const resetAll = async () => {
-    if (!window.confirm("登録した内容をすべて消して、最初のサンプルに戻します。よろしいですか？")) return;
-    setMaterials(seedMaterials); setPackaging(seedPackaging); setDoughs(seedDoughs); setFillings(seedFillings);
-    setBreads(seedBreads); setProducts(seedProducts); setShipment(seedShipment); setTargetRate(0.25);
-    await saveData({ materials: seedMaterials, packaging: seedPackaging, doughs: seedDoughs, fillings: seedFillings, breads: seedBreads, products: seedProducts, shipment: seedShipment, targetRate: 0.25 });
+    if (!window.confirm("登録した内容をすべて消して、最初のサンプルに戻します。\n（実行前に自動でバックアップを取ります）\n本当によろしいですか？")) return;
+    const input = window.prompt(`確認のため、下の言葉をそのまま入力してください。\n\n${RESET_PASSWORD}`);
+    if (input === null) return;
+    if (input.trim() !== RESET_PASSWORD) { setNotice("入力が違うため中止しました"); return; }
+    setBusy("リセット中…");
+    await saveSnapshot(currentPayload(), "リセット前の自動保存");
+    const seed = { materials: seedMaterials, packaging: seedPackaging, doughs: seedDoughs, fillings: seedFillings, breads: seedBreads, products: seedProducts, shipment: seedShipment, targetRate: 0.25 };
+    applyPayload(seed);
+    await saveData(seed);
+    await refreshHistory();
+    setBusy("");
+    setNotice("サンプルに戻しました（元に戻したい場合はバックアップタブから復元できます）");
   };
 
   const compSelect = (existing, selfId, onPick, label) => {
@@ -363,6 +442,7 @@ export default function BakeryCostApp() {
     { id: "breads", label: "パン", icon: Croissant },
     { id: "products", label: "製品", icon: ShoppingBag },
     { id: "shipment", label: "出荷・所要量", icon: ClipboardList },
+    { id: "backup", label: "バックアップ", icon: History },
   ];
 
   if (status === "loading") {
@@ -371,8 +451,8 @@ export default function BakeryCostApp() {
 
   return (
     <div className="min-h-screen bg-stone-100 font-sans text-stone-900">
-      <header className="border-b border-stone-200 bg-white">
-        <div className="mx-auto flex max-w-5xl items-center justify-between gap-3 px-4 py-4">
+      <header className="sticky top-0 z-20 border-b border-stone-200 bg-white/95 backdrop-blur">
+        <div className="mx-auto flex max-w-5xl items-center justify-between gap-3 px-3 py-3 sm:px-4 sm:py-4">
           <div className="flex items-center gap-2">
             <div className="flex h-9 w-9 items-center justify-center rounded-xl bg-amber-500 text-white"><Wheat size={20} /></div>
             <div>
@@ -395,7 +475,7 @@ export default function BakeryCostApp() {
               const Icon = t.icon; const active = tab === t.id;
               return (
                 <button key={t.id} onClick={() => setTab(t.id)}
-                  className={"flex shrink-0 items-center gap-1.5 rounded-lg px-3 py-2 text-sm font-medium transition-colors " + (active ? "bg-amber-500 text-white" : "text-stone-600 hover:bg-stone-100")}>
+                  className={"flex shrink-0 items-center gap-1.5 rounded-lg px-3 py-2.5 text-sm font-medium transition-colors " + (active ? "bg-amber-500 text-white" : "text-stone-600 hover:bg-stone-100")}>
                   <Icon size={16} />{t.label}
                 </button>
               );
@@ -404,7 +484,7 @@ export default function BakeryCostApp() {
         </div>
       </header>
 
-      <main className="mx-auto max-w-5xl px-4 py-6 space-y-4">
+      <main className="mx-auto max-w-5xl px-3 py-4 space-y-4 sm:px-4 sm:py-6">
 
         {/* ===== 原材料 ===== */}
         {tab === "materials" && (
@@ -558,7 +638,7 @@ export default function BakeryCostApp() {
               const c = breadCalc(b);
               return (
                 <Card key={b.id} className="overflow-hidden">
-                  <div className="grid gap-4 p-4 md:grid-cols-2">
+                  <div className="grid gap-4 p-3 sm:p-4 md:grid-cols-2">
                     <div>
                       <div className="flex items-center gap-2">
                         <Croissant size={16} className="shrink-0 text-amber-500" />
@@ -620,7 +700,7 @@ export default function BakeryCostApp() {
               const remainingBreads = breads.filter((b) => !(p.items || []).some((it) => it.breadId === b.id));
               return (
                 <Card key={p.id} className="overflow-hidden">
-                  <div className="grid gap-4 p-4 md:grid-cols-2">
+                  <div className="grid gap-4 p-3 sm:p-4 md:grid-cols-2">
                     {/* 左：構成 */}
                     <div>
                       <div className="flex items-center gap-2">
@@ -830,9 +910,87 @@ export default function BakeryCostApp() {
           </>
         )}
 
-        <div className="pt-2 text-center">
-          <button onClick={resetAll} className="text-xs text-stone-400 underline hover:text-stone-600">データをサンプルに戻す</button>
-        </div>
+        {/* ===== バックアップ ===== */}
+        {tab === "backup" && (
+          <>
+            <div className="flex items-start gap-2 rounded-xl bg-emerald-50 px-4 py-3 text-sm text-emerald-900">
+              <Info size={16} className="mt-0.5 shrink-0" />
+              <p>入力内容は<b>自動でバックアップ</b>されています。大事な変更の前後には<b>名前をつけて保存</b>しておくと、いつでもその時点に戻せます。ファイルとしてPCに保存もできます。</p>
+            </div>
+
+            {notice && (
+              <div className="flex items-center justify-between rounded-xl bg-stone-800 px-4 py-2.5 text-sm text-white">
+                <span>{notice}</span>
+                <button onClick={() => setNotice("")} className="text-stone-400 hover:text-white">×</button>
+              </div>
+            )}
+
+            <div className="grid gap-3 sm:grid-cols-3">
+              <button onClick={doManualBackup} disabled={!!busy}
+                className="flex items-center justify-center gap-2 rounded-xl bg-amber-500 px-4 py-3 text-sm font-semibold text-white hover:bg-amber-600 disabled:opacity-50">
+                <Save size={16} /> 今の状態を保存
+              </button>
+              <button onClick={() => downloadBackup(currentPayload())} disabled={!!busy}
+                className="flex items-center justify-center gap-2 rounded-xl border border-stone-300 bg-white px-4 py-3 text-sm font-semibold text-stone-700 hover:border-amber-400 disabled:opacity-50">
+                <Download size={16} /> ファイルに保存
+              </button>
+              <button onClick={() => fileRef.current?.click()} disabled={!!busy}
+                className="flex items-center justify-center gap-2 rounded-xl border border-stone-300 bg-white px-4 py-3 text-sm font-semibold text-stone-700 hover:border-amber-400 disabled:opacity-50">
+                <Upload size={16} /> ファイルから復元
+              </button>
+              <input ref={fileRef} type="file" accept=".json,application/json" className="hidden" onChange={doImportFile} />
+            </div>
+
+            {busy && <p className="flex items-center gap-2 text-sm text-stone-500"><Loader2 size={14} className="animate-spin" />{busy}</p>}
+
+            <Card className="overflow-hidden">
+              <div className="flex items-center justify-between border-b border-stone-100 bg-stone-50 px-4 py-3">
+                <span className="flex items-center gap-2 font-semibold"><History size={16} className="text-amber-500" /> 保存されている履歴</span>
+                <span className="text-xs text-stone-400">{history.length} 件</span>
+              </div>
+              {history.length === 0 ? (
+                <p className="px-4 py-8 text-center text-sm text-stone-400">まだ履歴がありません。<br className="sm:hidden" />「今の状態を保存」を押すか、しばらく編集すると自動で作られます。</p>
+              ) : (
+                <ul className="divide-y divide-stone-100">
+                  {history.map((h) => (
+                    <li key={h.id} className="flex flex-wrap items-center justify-between gap-2 px-4 py-3">
+                      <div className="min-w-0">
+                        <div className="flex items-center gap-2">
+                          <span className="truncate font-medium">{h.label}</span>
+                          {h.label === "自動" && <span className="shrink-0 rounded bg-stone-100 px-1.5 py-0.5 text-[10px] text-stone-500">自動</span>}
+                        </div>
+                        <div className="text-xs text-stone-400">{new Date(h.created_at).toLocaleString("ja-JP")}</div>
+                      </div>
+                      <button onClick={() => doRestore(h)} disabled={!!busy}
+                        className="flex shrink-0 items-center gap-1.5 rounded-lg border border-stone-300 px-3 py-1.5 text-sm font-medium text-stone-700 hover:border-amber-400 hover:text-amber-700 disabled:opacity-50">
+                        <RotateCcw size={14} /> この状態に戻す
+                      </button>
+                    </li>
+                  ))}
+                </ul>
+              )}
+              <div className="border-t border-stone-100 px-4 py-2 text-xs text-stone-400">
+                自動バックアップは編集から約10分ごとに1件、最新50件まで残ります。
+              </div>
+            </Card>
+
+            <Card className="overflow-hidden border-rose-200">
+              <div className="flex items-center gap-2 border-b border-rose-100 bg-rose-50 px-4 py-3 font-semibold text-rose-700">
+                <AlertTriangle size={16} /> 危険な操作
+              </div>
+              <div className="flex flex-wrap items-center justify-between gap-3 px-4 py-4">
+                <div className="text-sm text-stone-600">
+                  <div className="font-medium text-stone-800">データをサンプルに戻す</div>
+                  <div className="mt-0.5 text-xs">登録内容がすべて消えます。実行前に自動バックアップを取ります。</div>
+                </div>
+                <button onClick={resetAll} disabled={!!busy}
+                  className="flex items-center gap-1.5 rounded-lg border border-rose-300 px-3 py-2 text-sm font-medium text-rose-600 hover:bg-rose-50 disabled:opacity-50">
+                  <Lock size={14} /> リセット
+                </button>
+              </div>
+            </Card>
+          </>
+        )}
       </main>
     </div>
   );
